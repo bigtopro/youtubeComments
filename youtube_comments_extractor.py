@@ -204,8 +204,8 @@ def _format_single_thread_as_schema(thread_root: Dict[str, Any]) -> List[str]:
     Output:
         [
           "THREAD <root_id>",
-          "1|0|<root_text>",
-          "2|1|<reply_text>",
+          "1|0|<like_count>|<root_text>",
+          "2|1|<like_count>|<reply_text>",
           ...
         ]
     """
@@ -237,11 +237,13 @@ def _format_single_thread_as_schema(thread_root: Dict[str, Any]) -> List[str]:
         local_id = counter
         counter += 1
 
-        comment_text = node["comment"].get("text") or ""
+        comment = node["comment"]
+        comment_text = comment.get("text") or ""
+        like_count = comment.get("likeCount", 0)
         # Ensure single-line text as per schema.
         comment_text_one_line = " ".join(comment_text.split())
 
-        lines.append(f"{local_id}|{parent_local_id}|{comment_text_one_line}")
+        lines.append(f"{local_id}|{parent_local_id}|{like_count}|{comment_text_one_line}")
 
         for child in node["children"]:
             dfs(child, local_id)

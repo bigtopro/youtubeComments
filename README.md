@@ -125,7 +125,7 @@ Each thread (one root comment) is represented as:
 
 ```text
 THREAD <thread_id>
-<local_id>|<parent_local_id>|<text>
+<local_id>|<parent_local_id>|<like_count>|<text>
 ...
 ```
 
@@ -133,11 +133,11 @@ Example:
 
 ```text
 THREAD UgzHy6Mw2e3oc_GVYyl4AaABAg
-1|0|Root
-2|1|Reply A
-3|2|Reply B
-4|2|Reply C
-5|4|Reply D
+1|0|12|Root
+2|1|5|Reply A
+3|2|0|Reply B
+4|2|3|Reply C
+5|4|7|Reply D
 ```
 
 #### Field meanings
@@ -151,6 +151,7 @@ THREAD UgzHy6Mw2e3oc_GVYyl4AaABAg
   - `<parent_local_id>`:
     - `0` for the root comment.
     - Otherwise: `local_id` of the immediate parent.
+  - `<like_count>`: integer like count from the YouTube API (0 if missing).
   - `<text>`: single‑line comment text (Unicode + emoji preserved; internal newlines collapsed to spaces).
 
 #### Ordering guarantees

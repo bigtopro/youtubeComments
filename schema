@@ -1,0 +1,154 @@
+Here is the **short, implementation-ready description** of the new format — rules + schema only, no extra pipeline detail.
+
+---
+
+# Thread Format — Short Spec
+
+## 1) Thread structure
+
+* Each thread represents **one root comment**.
+* Root comment = comment with no `parentId`.
+* All replies (any depth) belong to the same thread.
+
+---
+
+## 2) Thread header
+
+```
+THREAD <thread_id>
+```
+
+**Rules**
+
+* `<thread_id>` = root comment’s original ID.
+* Exact string match.
+* One header per thread.
+
+---
+
+## 3) Comment line schema
+
+```
+<local_id>|<parent_local_id>|<like_count>|<text>
+```
+
+Pipe-delimited, no extra spaces.
+
+---
+
+## 4) Field definitions
+
+### local_id
+
+* Integer
+* Starts at 1 per thread
+* Unique within thread
+* Assigned in traversal order
+
+---
+
+### parent_local_id
+
+* `0` → root comment
+* Otherwise → local_id of immediate parent
+* Encodes reply hierarchy
+
+---
+
+### like_count
+
+* Integer
+* Directly from YouTube `likeCount`
+* `0` if missing
+
+---
+
+### text
+
+* Raw comment text
+* No truncation
+* No metadata
+* Unicode preserved
+* Emojis preserved
+
+---
+
+## 5) Ordering rules
+
+1. Root comment is always first:
+
+   ```
+   1|0|<root_text>
+   ```
+
+2. Traversal = **Depth-First Pre-Order**
+
+   Parent appears before its children.
+
+3. Siblings sorted by:
+
+   ```
+   publishedAt ASC
+   ```
+
+---
+
+## 6) Nesting / reply depth
+
+* Unlimited depth supported.
+* Reply-to-reply stored via parent_local_id chain.
+
+Example (with `like_count`):
+
+```
+1|0|12|Root
+2|1|5|Reply
+3|2|0|Reply to reply
+4|3|7|Reply to reply to reply
+```
+
+---
+
+## 7) ID interpretation
+
+* Do NOT infer hierarchy from dotted IDs.
+* Use only parent relationships.
+
+---
+
+## 8) Thread separation
+
+* Threads separated by one blank line.
+
+---
+
+# Minimal JSON Schema (structural)
+
+If represented programmatically:
+
+```json
+{
+  "thread_id": "string",
+  "comments": [
+    {
+      "local_id": "integer",
+      "parent_local_id": "integer",
+      "like_count": "integer",
+      "text": "string"
+    }
+  ]
+}
+```
+
+---
+
+# Validation invariants
+
+* local_id sequence = contiguous (1..N)
+* parent_local_id < local_id (except 0)
+* Exactly one parent_local_id = 0
+* No cycles
+* All comments connected to root
+
+---
+
