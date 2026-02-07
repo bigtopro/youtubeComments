@@ -22,6 +22,8 @@
   <thread_structure>
     Each thread starts with:
     <format>THREAD &lt;thread_id&gt;</format>
+    <format>REF &lt;ref&gt;</format>
+    where &lt;ref&gt; is a short id (e.g. T1, T2, T3). You MUST include this exact ref in your output for each signal so we can match signals to threads.
 
     Each comment line has the format:
     <comment_format>
@@ -182,6 +184,10 @@
       List of local_id values that support this signal unit.
     </source_comments>
 
+    <thread_ref>
+      REQUIRED. The exact REF value from the thread header (e.g. T1, T2) for the thread this signal belongs to. Copy it from the "REF &lt;ref&gt;" line of that thread.
+    </thread_ref>
+
   </axes>
 
   <output_constraints>
@@ -192,6 +198,7 @@
     <rule>Your entire response must parse as JSON. Start with { and end with }.</rule>
     <rule>Use only the keys listed in output_schema_example. Use the exact field names and value types.</rule>
     <rule>source_comments must be an array of integers (local_id values).</rule>
+    <rule>thread_ref must be the exact REF string (e.g. T1, T2) from the thread header for every signal.</rule>
     <rule>topics must be an array of strings. affirmation_flag must be a boolean.</rule>
   </output_constraints>
 
@@ -211,7 +218,8 @@
           "consensus_state": "agreed",
           "affirmation_flag": true,
           "signal_strength_hint": "high",
-          "source_comments": [1, 2]
+          "source_comments": [1, 2],
+          "thread_ref": "T1"
         }
       ]
     }

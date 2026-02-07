@@ -39,6 +39,12 @@ PROGRESS_SAVE_INTERVAL = 10  # Save progress every N batches
 MAX_PARSE_RETRIES = 2  # Retry API call up to this many times when JSON parsing fails
 LLM_LOG_DIR_DEFAULT = "llm_outputs"  # Default directory for logging raw LLM responses
 
+# Output token limits (DeepSeek API: default 4K, max 8K for deepseek-chat)
+# Batching must limit threads per batch so estimated output fits (avoid truncation → empty signals)
+MAX_OUTPUT_TOKENS_DEFAULT = 8000  # Request up to 8K when API allows
+AVG_OUTPUT_TOKENS_PER_THREAD = 150  # Conservative: ~140+ tokens per thread for signals JSON
+MAX_EMPTY_SIGNAL_RETRIES = 2  # Retry batches for threads that got empty signals (e.g. due to truncation)
+
 
 @dataclass
 class Thread:
@@ -142,14 +148,17 @@ def parse_threads_file(file_path: str) -> List[Thread]:
 def create_batches(
     threads: List[Thread],
     system_prompt: str,
-    max_tokens: int = MAX_CONTEXT_TOKENS
+    max_tokens: int = MAX_CONTEXT_TOKENS,
+    max_output_tokens: int = MAX_OUTPUT_TOKENS_DEFAULT,
+    avg_output_tokens_per_thread: int = AVG_OUTPUT_TOKENS_PER_THREAD,
 ) -> List[Batch]:
     """
     Create batches of threads ensuring:
     - No thread is split across batches (per schema: each thread is atomic)
-    - Total tokens (system prompt + threads) <= max_tokens
+    - INPUT: total tokens (system prompt + threads) <= max_tokens (context limit)
+    - OUTPUT: estimated output tokens (threads * avg per thread) <= max_output_tokens,
+      so the API response is not truncated (which causes empty signals for many threads).
     - Threads are never mixed (preserves thread integrity)
-    - Each batch maintains schema structure: THREAD header + comment lines
     
     Schema compliance:
     - Respects that each thread represents one root comment
@@ -160,78 +169,77 @@ def create_batches(
     """
     batches: List[Batch] = []
     system_tokens = estimate_tokens(system_prompt)
-    available_tokens = max_tokens - system_tokens
-    
-    if available_tokens <= 0:
+    available_input_tokens = max_tokens - system_tokens
+    max_threads_per_batch = max(1, max_output_tokens // avg_output_tokens_per_thread)
+
+    if available_input_tokens <= 0:
         raise ValueError(
             f"System prompt is too large ({system_tokens} tokens). "
             f"Max context is {max_tokens} tokens."
         )
-    
+
     current_batch_threads: List[Thread] = []
     current_batch_ids: List[str] = []
     current_batch_tokens = 0
     batch_index = 0
-    
+
     for thread in threads:
-        # Calculate tokens for this thread
-        thread_text = '\n'.join(thread.lines)
+        thread_text = "\n".join(thread.lines)
         thread_tokens = estimate_tokens(thread_text)
-        
-        # Warn if a single thread exceeds the limit (but still process it)
-        if thread_tokens > available_tokens:
+
+        # Output cap: don't exceed max_threads_per_batch (avoids response truncation)
+        would_exceed_output = len(current_batch_threads) >= max_threads_per_batch
+        # Input cap: don't exceed context limit
+        would_exceed_input = current_batch_tokens + thread_tokens > available_input_tokens
+
+        if thread_tokens > available_input_tokens:
             print(
-                f"Warning: Thread {thread.thread_id} exceeds token limit "
-                f"({thread_tokens} > {available_tokens} tokens). "
-                f"It will be processed in its own batch.",
-                file=sys.stderr
+                f"Warning: Thread {thread.thread_id} exceeds input token limit "
+                f"({thread_tokens} > {available_input_tokens}). Processing in its own batch.",
+                file=sys.stderr,
             )
-            # Save current batch if it has threads
             if current_batch_threads:
-                batches.append(Batch(
-                    threads=current_batch_threads.copy(),
-                    thread_ids=current_batch_ids.copy(),
-                    batch_index=batch_index,
-                    estimated_tokens=current_batch_tokens + system_tokens
-                ))
+                batches.append(
+                    Batch(
+                        threads=current_batch_threads.copy(),
+                        thread_ids=current_batch_ids.copy(),
+                        batch_index=batch_index,
+                        estimated_tokens=current_batch_tokens + system_tokens,
+                    )
+                )
                 batch_index += 1
-            
-            # Start new batch for this oversized thread
             current_batch_threads = []
             current_batch_ids = []
             current_batch_tokens = 0
-        
-        # Check if adding this thread would exceed the limit
-        elif current_batch_tokens + thread_tokens > available_tokens:
-            # Save current batch if it has threads
+        elif would_exceed_output or would_exceed_input:
             if current_batch_threads:
-                batches.append(Batch(
-                    threads=current_batch_threads.copy(),
-                    thread_ids=current_batch_ids.copy(),
-                    batch_index=batch_index,
-                    estimated_tokens=current_batch_tokens + system_tokens
-                ))
+                batches.append(
+                    Batch(
+                        threads=current_batch_threads.copy(),
+                        thread_ids=current_batch_ids.copy(),
+                        batch_index=batch_index,
+                        estimated_tokens=current_batch_tokens + system_tokens,
+                    )
+                )
                 batch_index += 1
-            
-            # Start new batch
             current_batch_threads = []
             current_batch_ids = []
             current_batch_tokens = 0
-        
-        # Add thread to current batch
+
         current_batch_threads.append(thread)
         current_batch_ids.append(thread.thread_id)
         current_batch_tokens += thread_tokens
-    
-    # Don't forget the last batch
+
     if current_batch_threads:
-        batches.append(Batch(
-            threads=current_batch_threads.copy(),
-            thread_ids=current_batch_ids.copy(),
-            batch_index=batch_index,
-            estimated_tokens=current_batch_tokens + system_tokens
-        ))
-    
+        batches.append(
+            Batch(
+                threads=current_batch_threads.copy(),
+                thread_ids=current_batch_ids.copy(),
+                batch_index=batch_index,
+                estimated_tokens=current_batch_tokens + system_tokens,
+            )
+        )
+
     return batches
 
 
@@ -245,23 +253,27 @@ def format_batch_for_api(batch: Batch, video_description: Optional[str] = None) 
     - Threads separated by blank lines (per schema)
     
     If video_description is provided, it will be included at the start.
+    Each thread is prefixed with a short REF (T1, T2, ...) so the model can echo it
+    in the output for reliable matching; we map ref -> thread_id when parsing.
     """
     lines: List[str] = []
-    
     if video_description:
         lines.append(f"Video Description: {video_description}")
-        lines.append('')
-    
-    # Format each thread preserving its structure
+        lines.append("")
+
     for i, thread in enumerate(batch.threads):
-        # Add all lines from thread (includes THREAD header and comment lines)
-        lines.extend(thread.lines)
-        # Add blank line separator between threads (per schema)
-        # Don't add trailing blank line after last thread
+        # First line must be THREAD <id>; insert REF T1, T2, ... right after for matching
+        ref = f"T{i + 1}"
+        if thread.lines:
+            lines.append(thread.lines[0])  # THREAD <thread_id>
+            lines.append(f"REF {ref}")
+            lines.extend(thread.lines[1:])  # comment lines
+        else:
+            lines.append(f"THREAD {thread.thread_id}")
+            lines.append(f"REF {ref}")
         if i < len(batch.threads) - 1:
-            lines.append('')
-    
-    return '\n'.join(lines)
+            lines.append("")
+    return "\n".join(lines)
 
 
 def call_deepseek_api(
@@ -269,36 +281,29 @@ def call_deepseek_api(
     system_prompt: str,
     user_content: str,
     batch_index: int,
-    retry_count: int = 0
+    retry_count: int = 0,
+    max_output_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Call DeepSeek API for a single batch with retry logic.
-    
-    Per API docs: Under high traffic, requests may take time and return empty lines
-    or keep-alive comments. Connection closes after 10 minutes if no inference starts.
-    
-    Returns the API response JSON.
+    Uses max_output_tokens (default 8K per API docs) so responses are not truncated.
     """
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
-    
+    # API max_tokens: controls max response length (see https://api-docs.deepseek.com/guides/json_mode).
+    # deepseek-chat: default 4K, maximum 8K. We request 8K by default to avoid truncation.
+    out_tokens = max_output_tokens if max_output_tokens is not None else MAX_OUTPUT_TOKENS_DEFAULT
     payload = {
         "model": DEEPSEEK_MODEL,
         "messages": [
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": user_content
-            }
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
         ],
         "response_format": {"type": "json_object"},
-        "temperature": 0.3,  # Lower temperature for more consistent labeling
-        "max_tokens": 4000  # Reserve space for response
+        "temperature": 0.3,  # Sweet spot: stable/repeatable, schema compliance, edge cases preserved (max 0.3 for this task)
+        "max_tokens": min(out_tokens, 8192),  # Requested response token limit (configurable via --max-output-tokens)
     }
     
     try:
@@ -344,7 +349,8 @@ def call_deepseek_api(
             )
             time.sleep(delay)
             return call_deepseek_api(
-                api_key, system_prompt, user_content, batch_index, retry_count + 1
+                api_key, system_prompt, user_content, batch_index, retry_count + 1,
+                max_output_tokens=max_output_tokens,
             )
         else:
             raise DeepSeekAPIError(
@@ -356,13 +362,15 @@ def process_batch(
     api_key: str,
     system_prompt: str,
     batch: Batch,
-    video_description: Optional[str] = None
+    video_description: Optional[str] = None,
+    max_output_tokens: Optional[int] = None,
 ) -> Tuple[int, Dict[str, Any], List[str]]:
-    """
-    Process a single batch and return (batch_index, response, thread_ids).
-    """
+    """Process a single batch and return (batch_index, response, thread_ids)."""
     user_content = format_batch_for_api(batch, video_description)
-    response = call_deepseek_api(api_key, system_prompt, user_content, batch.batch_index)
+    response = call_deepseek_api(
+        api_key, system_prompt, user_content, batch.batch_index,
+        max_output_tokens=max_output_tokens,
+    )
     return (batch.batch_index, response, batch.thread_ids)
 
 
@@ -372,6 +380,7 @@ def process_batch_with_parse_retry(
     batch: Batch,
     video_description: Optional[str] = None,
     llm_log_dir: Optional[str] = None,
+    max_output_tokens: Optional[int] = None,
 ) -> Tuple[int, Dict[str, Any], List[str]]:
     """
     Process a single batch with robust parsing and up to 2 API retries on parse failure.
@@ -384,7 +393,8 @@ def process_batch_with_parse_retry(
     for attempt in range(1 + MAX_PARSE_RETRIES):
         try:
             response = call_deepseek_api(
-                api_key, system_prompt, user_content, batch.batch_index
+                api_key, system_prompt, user_content, batch.batch_index,
+                max_output_tokens=max_output_tokens,
             )
             content = _extract_content_from_response(response)
             parsed = parse_json_robust(content)
@@ -392,6 +402,7 @@ def process_batch_with_parse_retry(
             if "signals" not in parsed:
                 parsed = {"signals": parsed if isinstance(parsed, list) else []}
 
+            usage = response.get("usage") or {}
             if llm_log_dir:
                 log_llm_output(
                     llm_log_dir,
@@ -400,8 +411,12 @@ def process_batch_with_parse_retry(
                     batch.thread_ids,
                     content,
                     parse_ok=True,
+                    completion_tokens=usage.get("completion_tokens"),
+                    prompt_tokens=usage.get("prompt_tokens"),
+                    total_tokens=usage.get("total_tokens"),
+                    system_prompt=system_prompt,
+                    user_content=user_content,
                 )
-            usage = response.get("usage") or {}
             return (batch.batch_index, parsed, batch.thread_ids, usage)
         except (ValueError, json.JSONDecodeError) as e:
             last_error = e
@@ -411,6 +426,7 @@ def process_batch_with_parse_retry(
                     raw_for_log = _extract_content_from_response(response)
                 except Exception:
                     pass
+                usage = response.get("usage") or {}
                 log_llm_output(
                     llm_log_dir,
                     batch.batch_index,
@@ -419,6 +435,11 @@ def process_batch_with_parse_retry(
                     raw_for_log,
                     parse_ok=False,
                     error_message=str(e),
+                    completion_tokens=usage.get("completion_tokens"),
+                    prompt_tokens=usage.get("prompt_tokens"),
+                    total_tokens=usage.get("total_tokens"),
+                    system_prompt=system_prompt,
+                    user_content=user_content,
                 )
             if attempt < MAX_PARSE_RETRIES:
                 print(
@@ -457,14 +478,21 @@ def log_llm_output(
     raw_content: str,
     parse_ok: bool,
     error_message: Optional[str] = None,
+    *,
+    completion_tokens: Optional[int] = None,
+    prompt_tokens: Optional[int] = None,
+    total_tokens: Optional[int] = None,
+    system_prompt: Optional[str] = None,
+    user_content: Optional[str] = None,
 ) -> None:
     """
-    Write raw LLM output to a file for debugging parsing issues.
-    One file per batch per attempt; filename includes batch and attempt.
+    Write a full trace log: what we sent to the LLM (system + user) and what we received.
+    Filename includes timestamp for tracing. One file per batch per attempt.
     """
     os.makedirs(llm_log_dir, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     safe_batch = batch_index  # 0-based
-    filename = f"batch_{safe_batch:04d}_attempt_{attempt}.txt"
+    filename = f"batch_{safe_batch:04d}_attempt_{attempt}_{ts}.txt"
     filepath = os.path.join(llm_log_dir, filename)
     meta = {
         "batch_index": batch_index,
@@ -475,11 +503,22 @@ def log_llm_output(
         "parse_ok": parse_ok,
         "content_length": len(raw_content),
     }
+    if completion_tokens is not None:
+        meta["completion_tokens"] = completion_tokens
+    if prompt_tokens is not None:
+        meta["prompt_tokens"] = prompt_tokens
+    if total_tokens is not None:
+        meta["total_tokens"] = total_tokens
     if error_message:
         meta["parse_error"] = error_message
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(json.dumps(meta, indent=2) + "\n")
-        f.write("---RAW_CONTENT---\n")
+        f.write("\n---SENT_TO_LLM---\n")
+        f.write("---system_prompt---\n")
+        f.write((system_prompt or "") + "\n")
+        f.write("---user_content---\n")
+        f.write((user_content or "") + "\n")
+        f.write("\n---RECEIVED_FROM_LLM---\n")
         f.write(raw_content)
         if not raw_content.endswith("\n"):
             f.write("\n")
@@ -585,6 +624,7 @@ def process_all_batches(
     existing_results: Optional[Dict[str, Dict[str, Any]]] = None,
     llm_log_dir: Optional[str] = None,
     stats_file: Optional[str] = None,
+    max_output_tokens: Optional[int] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Process all batches in parallel with idempotency and incremental saving.
@@ -626,7 +666,10 @@ def process_all_batches(
         return existing_results.copy()
 
     if llm_log_dir:
-        print(f"LLM output logging enabled: raw responses will be written to '{llm_log_dir}/'")
+        print(
+            f"LLM trace logging enabled: request + response written to '{llm_log_dir}/' "
+            f"(filenames include timestamp, e.g. batch_0000_attempt_1_YYYYMMDD_HHMMSS.txt)"
+        )
 
     print(
         f"Processing {len(batches_to_process)}/{len(batches)} batches "
@@ -696,6 +739,7 @@ def process_all_batches(
                     batch,
                     video_description,
                     llm_log_dir,
+                    max_output_tokens,
                 ): batch
                 for batch in batches_to_process
             }
@@ -726,11 +770,19 @@ def process_all_batches(
                     # Queue for incremental save
                     save_queue.put((batch_index, thread_results))
                     
-                    print(
-                        f"✓ Completed batch {batch_index + 1}/{len(batches)} "
-                        f"({len(thread_ids)} threads) "
-                        f"[{completed_count}/{len(batches)} total]"
-                    )
+                    out_tokens = (usage.get("completion_tokens") or 0) if len(result) == 4 else None
+                    if out_tokens is not None:
+                        print(
+                            f"✓ Completed batch {batch_index + 1}/{len(batches)} "
+                            f"({len(thread_ids)} threads, {out_tokens:,} out tokens) "
+                            f"[{completed_count}/{len(batches)} total]"
+                        )
+                    else:
+                        print(
+                            f"✓ Completed batch {batch_index + 1}/{len(batches)} "
+                            f"({len(thread_ids)} threads) "
+                            f"[{completed_count}/{len(batches)} total]"
+                        )
                 
                 except Exception as e:
                     print(
@@ -789,50 +841,58 @@ def map_batch_results_to_threads(
 ) -> Dict[str, Dict[str, Any]]:
     """
     Map batch API response to individual thread results.
+    Prefer thread_ref (T1, T2, ...) from the model when present; fall back to
+    source_comments matching for backward compatibility.
     """
-    thread_results: Dict[str, Dict[str, Any]] = {}
-    
-    # Build a mapping: for each thread, extract all local_ids it contains
+    ref_to_thread_id: Dict[str, str] = {
+        f"T{i + 1}": tid for i, tid in enumerate(thread_ids)
+    }
+
+    # Build a mapping: for each thread, extract all local_ids it contains (fallback)
     thread_local_ids: Dict[str, set] = {tid: set() for tid in thread_ids}
-    
     for thread in batch.threads:
         for line in thread.lines:
-            if '|' in line and not line.startswith('THREAD'):
-                parts = line.split('|', 1)
+            if "|" in line and not line.startswith("THREAD") and not line.startswith("REF "):
+                parts = line.split("|", 1)
                 if parts:
                     try:
                         local_id = int(parts[0].strip())
                         thread_local_ids[thread.thread_id].add(local_id)
                     except ValueError:
                         continue
-    
-    # Distribute signals to threads based on source_comments
+
     all_signals = signals_data.get("signals", [])
     thread_signals: Dict[str, List[Dict[str, Any]]] = {tid: [] for tid in thread_ids}
-    
+
     for signal in all_signals:
+        # Prefer thread_ref for matching when present and valid
+        thread_ref = signal.get("thread_ref")
+        if thread_ref and isinstance(thread_ref, str):
+            ref = str(thread_ref).strip()
+            if ref in ref_to_thread_id:
+                thread_signals[ref_to_thread_id[ref]].append(signal)
+                continue
+
+        # Fallback: distribute by source_comments
         source_comments = signal.get("source_comments", [])
         if not source_comments:
             if thread_ids:
                 thread_signals[thread_ids[0]].append(signal)
             continue
-        
         assigned = False
         for thread_id in thread_ids:
             if any(local_id in thread_local_ids[thread_id] for local_id in source_comments):
                 thread_signals[thread_id].append(signal)
                 assigned = True
                 break
-        
         if not assigned and thread_ids:
             thread_signals[thread_ids[0]].append(signal)
-    
-    # Store results for each thread
+
+    thread_results: Dict[str, Dict[str, Any]] = {}
     for thread_id in thread_ids:
         thread_results[thread_id] = {
             "signals": thread_signals.get(thread_id, [])
         }
-    
     return thread_results
     
 
@@ -955,6 +1015,68 @@ def load_system_prompt(prompt_file: str) -> str:
         return f.read()
 
 
+def retry_empty_signals(
+    api_key: str,
+    system_prompt: str,
+    results: Dict[str, Dict[str, Any]],
+    thread_by_id: Dict[str, Thread],
+    max_tokens: int,
+    max_output_tokens: int,
+    avg_output_tokens_per_thread: int,
+    video_description: Optional[str],
+    max_workers: int,
+    llm_log_dir: Optional[str],
+    output_file: Optional[str],
+    max_retries: int = MAX_EMPTY_SIGNAL_RETRIES,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Retry labeling for threads that ended up with empty signals (e.g. due to output truncation).
+    Re-batches only those threads (respecting output token cap) and merges results.
+    """
+    for attempt in range(max_retries):
+        empty_ids = [
+            tid for tid, data in results.items()
+            if not (data.get("signals"))
+        ]
+        if not empty_ids:
+            break
+        threads_to_retry = [thread_by_id[tid] for tid in empty_ids if tid in thread_by_id]
+        if not threads_to_retry:
+            break
+        print(
+            f"\nRetry {attempt + 1}/{max_retries}: {len(threads_to_retry)} threads with empty signals"
+        )
+        retry_batches = create_batches(
+            threads_to_retry,
+            system_prompt,
+            max_tokens=max_tokens,
+            max_output_tokens=max_output_tokens,
+            avg_output_tokens_per_thread=avg_output_tokens_per_thread,
+        )
+        # So process_all_batches doesn't skip these, pass existing_results without empty-signal threads
+        completed_only = {
+            tid: data for tid, data in results.items()
+            if data.get("signals")
+        }
+        more = process_all_batches(
+            api_key,
+            system_prompt,
+            retry_batches,
+            max_workers=max_workers,
+            video_description=video_description,
+            progress_file=None,
+            output_file=output_file,
+            existing_results=completed_only,
+            llm_log_dir=llm_log_dir,
+            stats_file=None,
+            max_output_tokens=max_output_tokens,
+        )
+        results.update(more)
+        if output_file:
+            save_results(results, output_file, append=False)
+    return results
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -1028,6 +1150,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         metavar="FILE",
         help="Write token usage and timing stats (JSON) to this file.",
     )
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=MAX_OUTPUT_TOKENS_DEFAULT,
+        help=f"Max response tokens per request (API default 4K, max 8K). Batches are capped so output fits (default: {MAX_OUTPUT_TOKENS_DEFAULT}).",
+    )
+    parser.add_argument(
+        "--avg-output-tokens-per-thread",
+        type=int,
+        default=AVG_OUTPUT_TOKENS_PER_THREAD,
+        help=f"Conservative estimate of output tokens per thread for batch sizing (default: {AVG_OUTPUT_TOKENS_PER_THREAD}).",
+    )
+    parser.add_argument(
+        "--retry-empty-signals",
+        action="store_true",
+        help="Retry labeling for threads that got empty signals (e.g. due to truncation), in smaller batches.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1074,26 +1213,36 @@ def main(argv: Optional[List[str]] = None) -> int:
     except Exception as e:
         sys.stderr.write(f"Error parsing threads file: {e}\n")
         return 1
-    
-    # Create batches
+
+    thread_by_id = {t.thread_id: t for t in threads}
+
+    # Create batches (capped by both input context and output token limit to avoid truncation)
     try:
-        print(f"\nCreating batches (max {args.max_tokens} tokens per batch)...")
-        batches = create_batches(threads, system_prompt, max_tokens=args.max_tokens)
+        max_threads_per_batch = max(1, args.max_output_tokens // args.avg_output_tokens_per_thread)
+        print(
+            f"\nCreating batches (input ≤{args.max_tokens} tokens, "
+            f"output ≤{args.max_output_tokens} tokens, max {max_threads_per_batch} threads/batch)..."
+        )
+        batches = create_batches(
+            threads,
+            system_prompt,
+            max_tokens=args.max_tokens,
+            max_output_tokens=args.max_output_tokens,
+            avg_output_tokens_per_thread=args.avg_output_tokens_per_thread,
+        )
         print(f"Created {len(batches)} batches")
-        
-        # Print batch statistics
+
         total_tokens = sum(batch.estimated_tokens for batch in batches)
-        print(f"Total estimated tokens: ~{total_tokens:,}")
-        
-        for i, batch in enumerate(batches[:5]):  # Show first 5 batches
-            print(f"  Batch {i + 1}: {len(batch.threads)} threads, "
-                  f"~{batch.estimated_tokens} tokens")
+        print(f"Total estimated input tokens: ~{total_tokens:,}")
+
+        for i, batch in enumerate(batches[:5]):
+            print(f"  Batch {i + 1}: {len(batch.threads)} threads, ~{batch.estimated_tokens} tokens")
         if len(batches) > 5:
             print(f"  ... and {len(batches) - 5} more batches")
     except Exception as e:
         sys.stderr.write(f"Error creating batches: {e}\n")
         return 1
-    
+
     # Process batches with idempotency and incremental saving
     try:
         results = process_all_batches(
@@ -1107,23 +1256,49 @@ def main(argv: Optional[List[str]] = None) -> int:
             existing_results=existing_results,
             llm_log_dir=args.llm_log_dir,
             stats_file=args.stats_file,
+            max_output_tokens=args.max_output_tokens,
         )
     except Exception as e:
         sys.stderr.write(f"Error processing batches: {e}\n")
         return 1
-    
-    # Final save (process_all_batches already saves incrementally, but ensure final state)
+
+    empty_count = sum(1 for d in results.values() if not d.get("signals"))
+    if empty_count > 0:
+        print(f"\nNote: {empty_count} thread(s) have empty signals (may be due to output truncation).")
+        if not args.retry_empty_signals:
+            print("  Run with --retry-empty-signals to retry those threads in smaller batches.")
+
+    # Retry threads that got empty signals (e.g. due to truncation)
+    if args.retry_empty_signals:
+        try:
+            results = retry_empty_signals(
+                api_key,
+                system_prompt,
+                results,
+                thread_by_id,
+                max_tokens=args.max_tokens,
+                max_output_tokens=args.max_output_tokens,
+                avg_output_tokens_per_thread=args.avg_output_tokens_per_thread,
+                video_description=args.video_description,
+                max_workers=args.max_parallel,
+                llm_log_dir=args.llm_log_dir,
+                output_file=args.output,
+                max_retries=MAX_EMPTY_SIGNAL_RETRIES,
+            )
+        except Exception as e:
+            sys.stderr.write(f"Error during empty-signal retry: {e}\n")
+            # Keep existing results
+
+    # Final save
     try:
         save_results(results, args.output, append=False)
-        if progress_file:
-            # Clean up progress file on successful completion
-            if os.path.exists(progress_file):
-                os.remove(progress_file)
-                print(f"Cleaned up progress file: {progress_file}")
+        if progress_file and os.path.exists(progress_file):
+            os.remove(progress_file)
+            print(f"Cleaned up progress file: {progress_file}")
     except Exception as e:
         sys.stderr.write(f"Error saving final results: {e}\n")
         return 1
-    
+
     return 0
 
 

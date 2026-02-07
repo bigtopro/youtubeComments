@@ -27,9 +27,9 @@ The pipeline takes **formatted comment threads** (from `youtube_comments_extract
   - `local_id` starts at 1 per thread.
 
 - **Batching rules** (no thread splitting, no mixing):
-  - **Context cap:** 7,000 tokens per request (1 English char ≈ 0.3 tokens).
-  - System prompt size is subtracted; remaining budget is filled with whole threads only.
-  - If a single thread exceeds the budget, it is sent in its own batch (with a warning).
+  - **Input cap:** 7,000 tokens per request (configurable). System prompt is subtracted; remaining budget is filled with whole threads only.
+  - **Output cap:** Batches are also limited by **estimated output size** so the API response is not truncated. The DeepSeek API returns at most 4K tokens by default, 8K max (see [Models & Pricing](https://api-docs.deepseek.com/quick_start/pricing)). Each thread’s signals use ~140+ tokens. So we cap **threads per batch** to `max_output_tokens / avg_output_tokens_per_thread` (default 8000/150 ≈ 53). This prevents large batches of one-line threads from producing truncated JSON and empty signals for most threads.
+  - If a single thread exceeds the input budget, it is sent in its own batch (with a warning).
 
 - **Output mapping:**  
   API returns one JSON object per batch with a `signals` array. Signals are mapped back to threads using `source_comments` (local_ids). Each thread’s signals are written with that thread’s `thread_id`; every signal object in the saved JSON also includes a **`thread_id`** field so labels are always tied to their comment thread.
@@ -69,6 +69,9 @@ The pipeline takes **formatted comment threads** (from `youtube_comments_extract
 - **Incremental saves:**  
   After each batch, results are merged and written to the output file (with a lock). So partial results are preserved if the process stops.
 
+- **Retry for empty signals:**  
+  If many threads in a batch get **empty signals** (e.g. because the response was truncated), the script can **retry** those threads in smaller batches. Use `--retry-empty-signals`. Retries run up to 2 times; only threads with empty signals are re-sent, with the same output-token cap so responses fit. After the first pass, the script prints how many threads have empty signals and suggests `--retry-empty-signals` if needed.
+
 ---
 
 ## 5. Token usage and throughput
@@ -88,18 +91,19 @@ The pipeline takes **formatted comment threads** (from `youtube_comments_extract
 
 ---
 
-## 6. LLM output logging (debugging)
+## 6. LLM trace logging (debugging)
 
 - **Option:** `--llm-log-dir <DIR>`  
 - **Behavior:**  
-  For each batch (and each retry attempt), a file is written:  
-  `DIR/batch_<index>_attempt_<n>.txt`  
-  containing:
-  - A JSON header: batch_index, attempt, thread_ids, timestamp_utc, parse_ok, content_length, and parse_error (if any).
-  - A line `---RAW_CONTENT---`.
-  - The raw model response (exactly as returned).
+  For each batch (and each retry attempt), a **trace** file is written:  
+  `DIR/batch_<index>_attempt_<n>_<YYYYMMDD>_<HHMMSS>.txt`  
+  (timestamp is UTC when the log is written).  
+  Each file contains:
+  - **Meta (JSON):** batch_index, attempt, thread_ids, timestamp_utc, parse_ok, content_length, completion_tokens, prompt_tokens, total_tokens (when available), and parse_error (if any).
+  - **---SENT_TO_LLM---:** full request: `---system_prompt---` (system prompt text) and `---user_content---` (batch threads + optional video description).
+  - **---RECEIVED_FROM_LLM---:** raw model response (exactly as returned).
 
-This allows debugging parsing issues and inspecting what the model returned.
+This gives a full trace of what was sent and received for each API call, for debugging and auditing.
 
 ---
 
@@ -181,7 +185,10 @@ python experiment_consistency.py --threads-file test.txt --runs 3 --out-dir expe
 | `--output` / `-o` | Output JSON path (required). |
 | `--system-prompt` | Path to system prompt XML (default: systemPrompt.xml). |
 | `--api-key` | DeepSeek API key (default: from DEEPSEEK_API_KEY). |
-| `--max-tokens` | Max context tokens per batch (default: 7000). |
+| `--max-tokens` | Max **input** context tokens per batch (default: 7000). |
+| `--max-output-tokens` | Max **response** tokens per request; batches are sized so output fits (default: 8000; API max 8K). |
+| `--avg-output-tokens-per-thread` | Estimate used to cap threads per batch (default: 150). |
+| `--retry-empty-signals` | Retry threads that got empty signals in smaller batches (up to 2 retries). |
 | `--max-parallel` | Max concurrent API requests (default: 20). |
 | `--video-description` | Optional video description for the prompt. |
 | `--progress-file` | Progress checkpoint path (for resume). |
@@ -198,7 +205,8 @@ python label_comments.py \
   --video-description "Video about fantasy shows..." \
   --llm-log-dir llm_outputs \
   --stats-file run_stats.json \
-  --max-parallel 10
+  --max-parallel 10 \
+  --retry-empty-signals
 ```
 
 ---
