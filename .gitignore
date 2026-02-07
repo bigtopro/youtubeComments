@@ -5,3 +5,10 @@ __pycache__/
 threads_*.txt
 *.log
 
+# Labeling pipeline generated outputs and logs
+llm_outputs/
+experiment_runs/
+*.progress.json
+*.tmp
+test_labeled.json
+
