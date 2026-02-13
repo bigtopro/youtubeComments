@@ -245,3 +245,208 @@ python youtube_comments_extractor.py \
 
 You can then feed `threads_rPckDuTaSnw.txt` directly to an LLM (or chunk by `THREAD` blocks) to analyse the full discussion while minimising token usage.
 
+---
+
+## 8. Data Labeling Pipeline
+
+After extracting comments, you can label them using the DeepSeek API to extract structured signals (critiques, ideas, questions, etc.) with topics.
+
+### 8.1. Label Comments
+
+```bash
+python label_comments.py \
+  --threads-file threads_rPckDuTaSnw_with_likes.txt \
+  --system-prompt systemPrompt.xml \
+  --output threads_rPckDuTaSnw_with_likes.txt_labeled.json \
+  --max-parallel 20
+```
+
+**Features:**
+- Batches threads respecting 7K token limit (input + output)
+- Never splits threads across batches
+- Parallel API calls for speed (default 20 workers)
+- Idempotent: skips already-processed threads
+- Incremental saving with progress checkpoints
+- Retry logic for failed batches
+
+**Output:** JSON with `threads` array, each containing `thread_id` and `signals` array.
+
+---
+
+## 9. Signal Grouping and Topic Consolidation
+
+After labeling, group signals by signal_type and topic, then consolidate near-duplicate topics.
+
+### 9.1. Group Signals by Type and Topic
+
+```bash
+python group_signals.py \
+  threads_rPckDuTaSnw_with_likes.txt_labeled.json \
+  --out buckets_threads_rPckDuTaSnw_with_likes.json
+```
+
+**Output:** JSON with nested structure:
+```json
+{
+  "buckets": {
+    "critique": {
+      "CIA influence": {
+        "signal_count": 14,
+        "thread_count": 12,
+        "thread_ids": [...]
+      },
+      ...
+    },
+    ...
+  }
+}
+```
+
+### 9.2. Consolidate Topics (Remove Near-Duplicates)
+
+Uses graph-based similarity grouping + LLM consolidation to merge semantically equivalent topics.
+
+```bash
+python consolidate_topics.py \
+  buckets_threads_rPckDuTaSnw_with_likes.json \
+  --out canonical_map.json
+```
+
+**How it works:**
+1. **Flatten topics**: Union of all topic strings across signal types
+2. **Embed**: Generate embeddings using `sentence-transformers` (default: `all-MiniLM-L6-v2`)
+3. **Build FAISS index**: Fast similarity search
+4. **Group by mutual neighbors**: Topics are grouped if they're mutual nearest neighbors above similarity threshold (default: 0.75)
+5. **LLM consolidation**: Each group (size ≥ 2) sent to DeepSeek for canonical label assignment
+6. **Output**: Mapping from original topic → canonical topic
+
+**Key parameters:**
+- `--similarity`: Similarity threshold (default: 0.75)
+- `--top-k`: Neighbors per topic (default: 25)
+- `--max-parallel`: Parallel API requests (default: 10)
+- `--skip-llm`: Only run grouping, skip LLM consolidation
+- `--threshold-sweep`: Test multiple thresholds, save batches JSON
+
+**Output:** JSON with `canonical_map`: `{"original_topic": "canonical_topic", ...}`
+
+---
+
+## 10. Experiments and Analysis
+
+### 10.1. Threshold Sweep
+
+Test grouping at multiple similarity thresholds:
+
+```bash
+python consolidate_topics.py \
+  buckets_threads_rPckDuTaSnw_with_likes.json \
+  --out threshold_sweep_batches.json \
+  --threshold-sweep 0.75 0.78 0.80 0.85 0.88 0.89 0.90 0.92
+```
+
+Shows how many groups form at each threshold (singletons vs multi-topic groups).
+
+### 10.2. Merge vs Split Experiment
+
+Measure how often LLM merges (1 cluster) vs splits (2+ clusters) at different thresholds:
+
+```bash
+python experiment_merge_split.py \
+  buckets_threads_rPckDuTaSnw_with_likes.json \
+  --out merge_split_results.json \
+  --log-dir llm_experiment_logs \
+  --max-parallel 40
+```
+
+**Output:** Summary table showing % merged vs % split per threshold.
+
+### 10.3. Transitive Closure Comparison
+
+Compare grouping WITH vs WITHOUT transitive closure:
+
+```bash
+python experiment_tc_merge_split.py \
+  buckets_threads_rPckDuTaSnw_with_likes.json \
+  --out tc_merge_split_results.json \
+  --log-dir tc_llm_logs \
+  --max-parallel 40
+```
+
+Shows if transitive closure creates better groupings (higher merge rate) or worse (higher split rate).
+
+### 10.4. Final Topic Count Analysis
+
+Analyze final unique topic counts after consolidation from existing logs:
+
+```bash
+python analyze_final_topic_count.py
+```
+
+Reads LLM logs and computes:
+- Total unique canonical topics (LLM canonical + singletons)
+- Comparison across thresholds
+- Comparison with/without transitive closure
+
+---
+
+## 11. Pipeline Overview
+
+```
+1. Extract comments
+   youtube_comments_extractor.py → threads.txt
+
+2. Label comments
+   label_comments.py → threads.txt_labeled.json
+
+3. Group signals
+   group_signals.py → buckets.json
+
+4. Consolidate topics
+   consolidate_topics.py → canonical_map.json
+
+5. (Optional) Analyze
+   experiment_merge_split.py → merge/split statistics
+   analyze_final_topic_count.py → final topic counts
+```
+
+---
+
+## 12. Key Design Decisions
+
+### Similarity Threshold (0.75)
+- Chosen based on experiments showing good balance:
+  - ~27% reduction in unique topics (4,691 → 3,429)
+  - ~63% merge rate (LLM keeps groups together)
+  - Avoids chain inflation from lower thresholds
+
+### Mutual Neighbor Requirement
+- Only groups topics if they're **mutual** nearest neighbors
+- Prevents one-way bridges and long chains
+- More conservative than transitive closure
+
+### No Size Cap in Grouping
+- Groups can grow as large as mutual neighbors allow (up to top_k+1)
+- Large groups are chunked when sending to LLM (not during grouping)
+- Preserves semantic coherence
+
+### Stricter LLM Prompt
+- Conservative about merging: "When in doubt, SPLIT rather than merge"
+- Helps identify problematic groupings (if LLM splits, grouping was likely wrong)
+
+---
+
+## 13. Dependencies
+
+See `requirements.txt`. Key additions:
+- `sentence-transformers`: For topic embeddings
+- `faiss-cpu`: For fast similarity search
+- `numpy`: For vector operations
+
+---
+
+## 14. Documentation Files
+
+- `batching.md`: Detailed design for topic consolidation pipeline
+- `graphing.md`: Graph-based similarity grouping theory and safeguards
+- `systemPrompt.xml`: LLM prompt for comment labeling
+

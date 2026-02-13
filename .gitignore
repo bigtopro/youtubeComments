@@ -12,3 +12,19 @@ experiment_runs/
 *.tmp
 test_labeled.json
 
+# Topic consolidation generated outputs
+threshold_sweep_batches.json
+merge_split_results.json
+transitive_comparison.json
+tc_merge_split_results.json
+final_topic_counts.json
+llm_experiment_logs/
+tc_llm_logs/
+
+# Large data files (buckets and labeled threads)
+buckets_*.json
+threads_*_labeled.json
+threads_*_stats.json
+
+# Test files
+test.txt
