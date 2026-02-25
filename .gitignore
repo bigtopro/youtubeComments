@@ -28,3 +28,16 @@ threads_*_stats.json
 
 # Test files
 test.txt
+
+# Macro topic labeller generated artifacts
+macro_logs_*/
+macro_test_logs/
+macro_mapping_*.json
+revised_buckets.json
+unique_topics.json
+test_macro_topics.json
+
+# Local workspace / editor / scratch
+.DS_Store
+recovered_chats/
+*.code-workspace
