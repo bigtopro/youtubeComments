@@ -1,452 +1,157 @@
-# youtubeComments — Fast YouTube Comment Thread Extractor
+# YouTube comment analyzer
 
-This repo contains a **YouTube comments extractor** optimised for:
+Turns a video's comment threads into audience signals so creators can see how viewers feel, what videos they want next, and what they find confusing. It produces JSON labels and topic groups, with references back to the discussion.
 
-- **Speed**: parallel fetching of replies + round‑robin use of multiple API keys.
-- **LLM‑friendly format**: a compact, token‑efficient thread schema for downstream analysis.
+The labels capture:
 
-It uses the **YouTube Data API v3** to fetch:
+- Praise, criticism, requests, and other responses as `affirmation`, `critique`, `suggestion`, `idea`, `question`, `confusion`, `disagreement`, or `meta`. Video requests can appear as suggestions or ideas, and doubts as questions or confusion.
+- Emotion as `enjoyment`, `frustration`, `excitement`, `disappointment`, `curiosity`, `anger`, `trust`, or `neutral`, plus intensity.
+- Specific topics, how clearly viewers express their point, reply engagement, and whether replies agree or dispute it.
+- Broader macro topics that collect related topics across the video.
 
-- All **top‑level comments** for a video.
-- All **direct replies** to each top‑level comment.
-- A **virtual deep thread tree** inferred from `@mentions` so you can treat the discussion as having more than two levels of depth.
+In our runs it cost about **₹50–100 for a video with 10,000 comments**. Labeling uses DeepSeek's `deepseek-chat` (at the time $0.28 per million input tokens and $0.42 per million output tokens), and `label_comments.py` logs token usage per run.
 
----
+## How it works
 
-## 1. Features
-
-- **Full thread coverage**
-  - Fetches every root comment and all its replies.
-  - Handles pagination for both `commentThreads.list` and `comments.list`.
-
-- **Multi‑key parallelism**
-  - Supports multiple API keys (`YOUTUBE_API_KEY_1`, `YOUTUBE_API_KEY_2`, …).
-  - Uses a thread‑safe round‑robin key pool to:
-    - Spread quota load across keys.
-    - Issue many reply‑fetch requests **in parallel**.
-
-- **Virtual deep threading**
-  - YouTube’s API only exposes: **root comment** + **direct replies**.
-  - This tool builds a **virtual hierarchy with >2 levels** by:
-    - Inspecting `@mentions` in reply text (e.g. `@raining_macondo`).
-    - Normalising author names and mention tokens.
-    - Attaching each reply to the **most recent earlier comment** whose author matches the mention.
-  - If no good match is found, the reply is attached directly to the root.
-
-- **Compact THREAD schema for LLMs**
-  - Output format designed to minimise tokens while preserving structure.
-  - Depth‑first pre‑order traversal with chronological sibling ordering.
-
----
-
-## 2. Installation
-
-### 2.1. Clone the repo
-
-```bash
-git clone https://github.com/bigtopro/youtubeComments.git
-cd youtubeComments
+```mermaid
+flowchart TD
+    A[YouTube Data API: comments and replies] --> B[Compact THREAD text]
+    B --> C[Batch whole threads]
+    C --> D[DeepSeek: audience signal labels]
+    D --> E[Group by signal type and topic]
+    E --> F[Embeddings and mutual-neighbor similarity graph]
+    F --> G[DeepSeek: consolidate equivalent topics]
+    G --> H[Apply canonical topic map to groups]
+    H --> I[DeepSeek: macro labels and cross-batch deduplication]
 ```
 
-### 2.2. Create and activate a virtual environment
+The scripts call DeepSeek's `deepseek-chat` model. Labeling works on whole threads, so replies provide context for a signal. One comment can contain several signals, and several comments can support the same signal.
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
-```
+The difficult parts are preserving that context within token budgets and deciding which topic phrases mean the same thing. `label_comments.py` targets about 7,000 input tokens per batch and also limits thread count using an estimate of 150 output tokens per thread. These are estimates, not hard guarantees. Oversized threads are kept whole.
 
-### 2.3. Install dependencies
+Topic consolidation embeds phrases with `all-MiniLM-L6-v2`, searches with FAISS, and groups mutual nearest neighbors above a similarity threshold. DeepSeek then decides which phrases to merge or keep separate. The canonical map combines topic buckets while retaining thread references. Finally, `macro_labeller.py` groups canonical topics in batches of 200, then merges equivalent macro labels across batches.
 
-```bash
-pip install -r requirements.txt
-```
+## What the output looks like
 
----
+No recorded labeled output is included in this checkout. This is the **schema example from [systemPrompt.xml](systemPrompt.xml)**, not a result from a video:
 
-## 3. Configure API keys
-
-Create a `.env` file **in the repo root** (do not commit it) with one or more YouTube Data API keys:
-
-```bash
-touch .env
-```
-
-Example `.env`:
-
-```env
-YOUTUBE_API_KEY_1=YOUR_FIRST_API_KEY
-YOUTUBE_API_KEY_2=YOUR_SECOND_API_KEY
-YOUTUBE_API_KEY_3=YOUR_THIRD_API_KEY
-```
-
-Rules:
-
-- At least **one** API key is required.
-- Any environment variable whose name starts with `YOUTUBE_API_KEY` and has a non‑empty value will be used.
-- Keys are placed in a **round‑robin pool** and used across all API calls.
-
-You can also pass a primary key via `--api-key`; it will be added to the pool as well.
-
----
-
-## 4. Usage
-
-The main entrypoint is `youtube_comments_extractor.py`.
-
-### 4.1. Basic usage (JSON output)
-
-```bash
-source .venv/bin/activate
-
-python youtube_comments_extractor.py \
-  --video-id rPckDuTaSnw \
-  --format json \
-  --output comments.json
-```
-
-This writes a structured JSON file:
-
-- One object per **root comment**, with:
-  - `id`, `videoId`, `author`, `text`, `likeCount`, `publishedAt`, `updatedAt`
-  - `replies`: list of direct replies (as returned by the API).
-
-### 4.2. LLM‑ready THREAD format
-
-Use the compact, token‑efficient format designed for LLM analysis:
-
-```bash
-python youtube_comments_extractor.py \
-  --video-id rPckDuTaSnw \
-  --format threads \
-  --output threads.txt
-```
-
-Each thread (one root comment) is represented as:
-
-```text
-THREAD <thread_id>
-<local_id>|<parent_local_id>|<like_count>|<text>
-...
-```
-
-Example:
-
-```text
-THREAD UgzHy6Mw2e3oc_GVYyl4AaABAg
-1|0|12|Root
-2|1|5|Reply A
-3|2|0|Reply B
-4|2|3|Reply C
-5|4|7|Reply D
-```
-
-#### Field meanings
-
-- **THREAD line**
-  - `THREAD <thread_id>`
-  - `thread_id` is the original **YouTube top‑level comment ID**.
-
-- **Comment lines**
-  - `<local_id>`: integer, starts at 1 per thread, unique within thread.
-  - `<parent_local_id>`:
-    - `0` for the root comment.
-    - Otherwise: `local_id` of the immediate parent.
-  - `<like_count>`: integer like count from the YouTube API (0 if missing).
-  - `<text>`: single‑line comment text (Unicode + emoji preserved; internal newlines collapsed to spaces).
-
-#### Ordering guarantees
-
-Within each thread:
-
-1. Root comment is always first:
-
-   ```text
-   1|0|<root_text>
-   ```
-
-2. Traversal is **depth‑first pre‑order**:
-   - A parent always appears before its children.
-
-3. Siblings are sorted by:
-
-   ```text
-   publishedAt ASC
-   ```
-
-Threads are separated by a single blank line.
-
----
-
-## 5. CLI options
-
-```bash
-python youtube_comments_extractor.py --help
-```
-
-Key arguments:
-
-- `--video-id` (**required**): YouTube video ID (`v` parameter in the URL).
-- `--api-key`: primary API key (optional if provided in env).
-- `--output` / `-o`: output file path. If omitted, prints to stdout.
-- `--format`:
-  - `json` (default): full JSON.
-  - `threads`: compact THREAD schema for LLMs.
-- `--indent`: JSON indentation (only used with `--format json`).
-- `--page-size`: batch size per API call (1–100, default 100).
-
----
-
-## 6. How the deep threading heuristic works
-
-Because the YouTube API only models:
-
-- Root comments, and
-- Direct replies to root,
-
-this tool builds a **virtual multi‑level tree** using a heuristic:
-
-1. For each root, collect all replies and sort them by `publishedAt` ascending.
-2. For each reply:
-   - Extract `@mentions` from the text (e.g. `@raining_macondo`).
-   - Normalise both mention tokens and author names:
-     - Lowercase.
-     - Remove non‑alphanumeric characters.
-   - Search backwards through earlier comments in the same thread
-     (root + previous replies) and find the **most recent** one
-     whose normalised author string contains the mention token.
-   - Attach the reply as a child of that comment.
-3. If no suitable parent is found, attach the reply directly to the root.
-
-This produces a **best‑effort deeper hierarchy** where:
-
-- Explicit `@mentions` control the inferred parent/child relationships.
-- Chronology breaks ties (preference to the most recent eligible parent).
-- The resulting tree can have **arbitrary depth** for analysis purposes.
-
----
-
-## 7. Example end‑to‑end flow
-
-```bash
-git clone https://github.com/bigtopro/youtubeComments.git
-cd youtubeComments
-
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-echo 'YOUTUBE_API_KEY_1=YOUR_API_KEY_HERE' > .env
-
-python youtube_comments_extractor.py \
-  --video-id rPckDuTaSnw \
-  --format threads \
-  --output threads_rPckDuTaSnw.txt
-```
-
-You can then feed `threads_rPckDuTaSnw.txt` directly to an LLM (or chunk by `THREAD` blocks) to analyse the full discussion while minimising token usage.
-
----
-
-## 8. Data Labeling Pipeline
-
-After extracting comments, you can label them using the DeepSeek API to extract structured signals (critiques, ideas, questions, etc.) with topics.
-
-### 8.1. Label Comments
-
-```bash
-python label_comments.py \
-  --threads-file threads_rPckDuTaSnw_with_likes.txt \
-  --system-prompt systemPrompt.xml \
-  --output threads_rPckDuTaSnw_with_likes.txt_labeled.json \
-  --max-parallel 20
-```
-
-**Features:**
-- Batches threads respecting 7K token limit (input + output)
-- Never splits threads across batches
-- Parallel API calls for speed (default 20 workers)
-- Idempotent: skips already-processed threads
-- Incremental saving with progress checkpoints
-- Retry logic for failed batches
-
-**Output:** JSON with `threads` array, each containing `thread_id` and `signals` array.
-
----
-
-## 9. Signal Grouping and Topic Consolidation
-
-After labeling, group signals by signal_type and topic, then consolidate near-duplicate topics.
-
-### 9.1. Group Signals by Type and Topic
-
-```bash
-python group_signals.py \
-  threads_rPckDuTaSnw_with_likes.txt_labeled.json \
-  --out buckets_threads_rPckDuTaSnw_with_likes.json
-```
-
-**Output:** JSON with nested structure:
 ```json
 {
-  "buckets": {
-    "critique": {
-      "CIA influence": {
-        "signal_count": 14,
-        "thread_count": 12,
-        "thread_ids": [...]
-      },
-      ...
-    },
-    ...
-  }
+    "signals": [
+        {
+            "signal_type": "affirmation",
+            "topics": ["heroic fantasy", "moral clarity"],
+            "emotion": "enjoyment",
+            "emotion_intensity": "medium",
+            "intent_clarity": "clear",
+            "specificity": "somewhat_specific",
+            "local_prevalence_hint": "few_comments",
+            "engagement_depth": "multi_reply_discussion",
+            "consensus_state": "agreed",
+            "affirmation_flag": true,
+            "signal_strength_hint": "high",
+            "source_comments": [1, 2],
+            "thread_ref": "T1"
+        }
+    ]
 }
 ```
 
-### 9.2. Consolidate Topics (Remove Near-Duplicates)
+The saved labeling file wraps signals in `threads`, adds the original `thread_id`, and keeps `source_comments` as local comment IDs. Grouped output contains signal counts, distinct thread counts, and thread IDs for each signal type and topic. Macro output contains `canonical_to_macro`, `macro_to_canonicals`, and `global_macro_list`.
 
-Uses graph-based similarity grouping + LLM consolidation to merge semantically equivalent topics.
+Counts refer to signals and threads, not unique viewers. A signal can have multiple topics, so topic counts can overlap.
 
-```bash
-python consolidate_topics.py \
-  buckets_threads_rPckDuTaSnw_with_likes.json \
-  --out canonical_map.json
-```
+## Where to look
 
-**How it works:**
-1. **Flatten topics**: Union of all topic strings across signal types
-2. **Embed**: Generate embeddings using `sentence-transformers` (default: `all-MiniLM-L6-v2`)
-3. **Build FAISS index**: Fast similarity search
-4. **Group by mutual neighbors**: Topics are grouped if they're mutual nearest neighbors above similarity threshold (default: 0.75)
-5. **LLM consolidation**: Each group (size ≥ 2) sent to DeepSeek for canonical label assignment
-6. **Output**: Mapping from original topic → canonical topic
+| File | Role in the pipeline |
+| --- | --- |
+| [youtube_comments_extractor.py](youtube_comments_extractor.py) | Paginate comments and replies, rotate keys, and write JSON or THREAD text. |
+| [systemPrompt.xml](systemPrompt.xml) | Exact signal types, emotion labels, and source-reference schema. |
+| [label_comments.py](label_comments.py) | Batch threads, call DeepSeek, map labels to threads, save progress, and log tokens. |
+| [group_signals.py](group_signals.py) | Count signals and threads by signal type and topic. |
+| [consolidate_topics.py](consolidate_topics.py) | Embed topics, build similarity groups, and request canonical labels. |
+| [apply_canonical_map.py](apply_canonical_map.py) | Merge topic buckets using the canonical map. |
+| [macro_labeller.py](macro_labeller.py) | Build broader topic labels and validate topic-number coverage. [macroPrompt.md](macroPrompt.md) records the design brief. |
+| [DOCS_LABELING_PIPELINE.md](DOCS_LABELING_PIPELINE.md) | More detail on labeling, trace logs, and CLI options. Some descriptions predate the current code. |
 
-**Key parameters:**
-- `--similarity`: Similarity threshold (default: 0.75)
-- `--top-k`: Neighbors per topic (default: 25)
-- `--max-parallel`: Parallel API requests (default: 10)
-- `--skip-llm`: Only run grouping, skip LLM consolidation
-- `--threshold-sweep`: Test multiple thresholds, save batches JSON
+The `experiment_*.py` scripts investigate pipeline choices:
 
-**Output:** JSON with `canonical_map`: `{"original_topic": "canonical_topic", ...}`
+- `experiment_consistency.py` repeats labeling and compares signal type, topic, and emotion sets using Jaccard similarity and exact matches.
+- `experiment_merge_split.py` varies similarity thresholds and records how often DeepSeek merges or splits candidate groups.
+- `experiment_transitive_closure.py` compares direct mutual-neighbor groups with groups connected through intermediate topics. `experiment_tc_merge_split.py` compares their merge/split behavior with DeepSeek.
 
----
+These scripts measure repeatability and grouping behavior, not accuracy against human labels. Their generated reports are not included. `count_signal_types.py`, `extract_unique_topics.py`, and `analyze_final_topic_count.py` are inspection helpers. The Cursor chat and workspace scripts are separate from the analyzer.
 
-## 10. Experiments and Analysis
+## How this grew
 
-### 10.1. Threshold Sweep
+This grew out of the [song recommendation engine](https://github.com/bigtopro/song-recommendation-engine) through an earlier private comment-analysis version. That version, developed from December 2025 to February 2026, combined clustering and GoEmotions emotion classification with a Django API and React dashboard.
 
-Test grouping at multiple similarity thresholds:
+This repo's [commit history](https://github.com/bigtopro/youtubeComments/commits) records the February 2026 progression from extraction to signal labeling, topic consolidation, and macro labels.
 
-```bash
-python consolidate_topics.py \
-  buckets_threads_rPckDuTaSnw_with_likes.json \
-  --out threshold_sweep_batches.json \
-  --threshold-sweep 0.75 0.78 0.80 0.85 0.88 0.89 0.90 0.92
-```
+## Run the pipeline
 
-Shows how many groups form at each threshold (singletons vs multi-topic groups).
+The commands below document the scripts as written. They make API calls. The scripts call `deepseek-chat`; check DeepSeek's current model list before running them.
 
-### 10.2. Merge vs Split Experiment
-
-Measure how often LLM merges (1 cluster) vs splits (2+ clusters) at different thresholds:
+Install the dependencies:
 
 ```bash
-python experiment_merge_split.py \
-  buckets_threads_rPckDuTaSnw_with_likes.json \
-  --out merge_split_results.json \
-  --log-dir llm_experiment_logs \
-  --max-parallel 40
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-**Output:** Summary table showing % merged vs % split per threshold.
+Create a `.env` file in the repository root. `.gitignore` excludes it.
 
-### 10.3. Transitive Closure Comparison
+```dotenv
+YOUTUBE_API_KEY_1=YOUR_YOUTUBE_API_KEY
+DEEPSEEK_API_KEY=YOUR_DEEPSEEK_API_KEY
+```
 
-Compare grouping WITH vs WITHOUT transitive closure:
+Run each stage in order, replacing `VIDEO_ID` with the video's ID:
 
 ```bash
-python experiment_tc_merge_split.py \
-  buckets_threads_rPckDuTaSnw_with_likes.json \
-  --out tc_merge_split_results.json \
-  --log-dir tc_llm_logs \
-  --max-parallel 40
+python youtube_comments_extractor.py \
+    --video-id VIDEO_ID --format threads --output threads.txt
+
+python label_comments.py \
+    --threads-file threads.txt --output labeled.json \
+    --stats-file run_stats.json --llm-log-dir llm_outputs \
+    --retry-empty-signals
+
+python group_signals.py labeled.json --out buckets.json
+
+python consolidate_topics.py buckets.json --out canonical_map.json
+
+python apply_canonical_map.py buckets.json canonical_map.json \
+    --out revised_buckets.json
+
+python macro_labeller.py revised_buckets.json --from-buckets \
+    --out macro_mapping.json --log-dir macro_logs
 ```
 
-Shows if transitive closure creates better groupings (higher merge rate) or worse (higher split rate).
+Use `--video-description` on the labeler and `--title` and `--description` on the macro labeller to supply video context. `extract_unique_topics.py` is an optional intermediate step; the macro labeller can read revised buckets directly.
 
-### 10.4. Final Topic Count Analysis
+The labeler saves results after each batch and supports `--resume` with a progress file. Inspect errors and empty signals before relying on the output. `--stats-file` covers the initial labeling pass's returned usage, not every paid retry or the consolidation and macro stages.
 
-Analyze final unique topic counts after consolidation from existing logs:
+## Extractor details
 
-```bash
-python analyze_final_topic_count.py
+The extractor paginates both top-level comments and replies through YouTube Data API v3. Replies are fetched concurrently with up to 32 workers. It can only retrieve comments the API makes available, and reply-fetch failures can leave incomplete output because worker exceptions are not currently checked.
+
+### THREAD format
+
+```text
+THREAD <youtube_top_level_comment_id>
+<local_id>|<parent_local_id>|<like_count>|<text>
 ```
 
-Reads LLM logs and computes:
-- Total unique canonical topics (LLM canonical + singletons)
-- Comparison across thresholds
-- Comparison with/without transitive closure
+Each thread starts at local ID `1`. Parent ID `0` marks the root. Parents precede children in depth-first order, siblings follow publication time, and blank lines separate threads. Text stays on one line. The labeler inserts a short `REF T1` header per thread in each API batch so the model can refer to it.
 
----
+### Key rotation
 
-## 11. Pipeline Overview
+Set one or more nonempty environment variables beginning with `YOUTUBE_API_KEY`, such as `YOUTUBE_API_KEY_1` and `YOUTUBE_API_KEY_2`. A thread-safe pool selects keys in round-robin order for requests. `--api-key` can add a key to the pool. Rotation distributes requests across configured keys; it does not retry a failed request with another key.
 
-```
-1. Extract comments
-   youtube_comments_extractor.py → threads.txt
+### Virtual deep threading
 
-2. Label comments
-   label_comments.py → threads.txt_labeled.json
+YouTube exposes replies under a top-level comment. The THREAD formatter infers a deeper tree from `@mentions`: it normalizes names and attaches each reply to the most recent earlier matching author in the thread. If no match exists, the reply stays under the root. This hierarchy is a heuristic, not a relationship supplied by YouTube.
 
-3. Group signals
-   group_signals.py → buckets.json
-
-4. Consolidate topics
-   consolidate_topics.py → canonical_map.json
-
-5. (Optional) Analyze
-   experiment_merge_split.py → merge/split statistics
-   analyze_final_topic_count.py → final topic counts
-```
-
----
-
-## 12. Key Design Decisions
-
-### Similarity Threshold (0.75)
-- Chosen based on experiments showing good balance:
-  - ~27% reduction in unique topics (4,691 → 3,429)
-  - ~63% merge rate (LLM keeps groups together)
-  - Avoids chain inflation from lower thresholds
-
-### Mutual Neighbor Requirement
-- Only groups topics if they're **mutual** nearest neighbors
-- Prevents one-way bridges and long chains
-- More conservative than transitive closure
-
-### No Size Cap in Grouping
-- Groups can grow as large as mutual neighbors allow (up to top_k+1)
-- Large groups are chunked when sending to LLM (not during grouping)
-- Preserves semantic coherence
-
-### Stricter LLM Prompt
-- Conservative about merging: "When in doubt, SPLIT rather than merge"
-- Helps identify problematic groupings (if LLM splits, grouping was likely wrong)
-
----
-
-## 13. Dependencies
-
-See `requirements.txt`. Key additions:
-- `sentence-transformers`: For topic embeddings
-- `faiss-cpu`: For fast similarity search
-- `numpy`: For vector operations
-
----
-
-## 14. Documentation Files
-
-- `batching.md`: Detailed design for topic consolidation pipeline
-- `graphing.md`: Graph-based similarity grouping theory and safeguards
-- `systemPrompt.xml`: LLM prompt for comment labeling
-
+For full comment objects instead of THREAD text, use `--format json`. The extractor also accepts `--page-size` from 1 to 100, `--indent` for JSON, and `--output` for a file. Without `--output`, it prints the result to standard output.
